@@ -16,7 +16,7 @@ enum {
 };
 
 typedef struct lock_free_queue {
-    void *buf;
+    uint8_t *buf;
     size_t el_size;
     int len;
     int wrap_mask;
@@ -113,8 +113,9 @@ void lfqueue_deinit(LFQueue *q)
     q->buf = NULL;
 }
 
-int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf, int inbuf_len)
+int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len)
 {
+    uint8_t *inbuf = inbuf_v;    
     if (inbuf_len > q->len / 2) {
         return LFQUEUE_OVERSIZE_INBUF;
     } else if (inbuf_len == 0) {
@@ -151,8 +152,9 @@ int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf, int inbuf_len)
     return LFQUEUE_SUCCESS;
 }
 
-int lfqueue_try_dequeue(LFQueue *q, void *restrict dstbuf, int dstbuf_len)
+int lfqueue_try_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len)
 {
+    uint8_t *dstbuf = dstbuf_v;
     if (dstbuf_len == 0) return LFQUEUE_SUCCESS;
     int loc_read_i = atomic_load_explicit(&q->read_i, memory_order_relaxed);
     int loc_write_i = atomic_load_explicit(&q->write_i, memory_order_acquire);
@@ -179,8 +181,9 @@ int lfqueue_try_dequeue(LFQueue *q, void *restrict dstbuf, int dstbuf_len)
     return LFQUEUE_SUCCESS;
 }
 
-int lfqueue_wait_enqueue(LFQueue *q, void *restrict inbuf, int inbuf_len, useconds_t loop_sleep, _Atomic bool *cancel_opt)
+int lfqueue_wait_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len, useconds_t loop_sleep, _Atomic bool *cancel_opt)
 {
+    uint8_t *inbuf = inbuf_v;
     if (inbuf_len > q->len / 2) {
         return LFQUEUE_OVERSIZE_INBUF;
     } else if (inbuf_len == 0) {
@@ -218,7 +221,7 @@ int lfqueue_wait_enqueue(LFQueue *q, void *restrict inbuf, int inbuf_len, usecon
     int write_dst = (loc_write_i + inbuf_len) & q->wrap_mask;
 
     if (loc_write_i < write_dst) {
-        memcpy(q->buf + loc_write_i, inbuf, inbuf_len * q->el_size);
+        memcpy(q->buf + loc_write_i * q->el_size, inbuf, inbuf_len * q->el_size);
     } else {
         int left = q->len - loc_write_i;
         memcpy(q->buf + loc_write_i * q->el_size, inbuf, left * q->el_size);
@@ -230,8 +233,9 @@ canceled:
     return LFQUEUE_OP_CANCELED;
 }
 
-int lfqueue_wait_dequeue(LFQueue *q, void *restrict dstbuf, int dstbuf_len, useconds_t loop_sleep, _Atomic bool *cancel_opt)
+int lfqueue_wait_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len, useconds_t loop_sleep, _Atomic bool *cancel_opt)
 {
+    uint8_t *dstbuf = dstbuf_v;
     if (dstbuf_len == 0) return LFQUEUE_SUCCESS;
     int loc_read_i;
     int loc_write_i;
@@ -257,7 +261,7 @@ int lfqueue_wait_dequeue(LFQueue *q, void *restrict dstbuf, int dstbuf_len, usec
 
     int read_dst = (loc_read_i + dstbuf_len) & q->wrap_mask;
     if (loc_read_i < read_dst) {
-        memcpy(dstbuf, q->buf + loc_read_i, dstbuf_len * q->el_size);
+        memcpy(dstbuf, q->buf + loc_read_i * q->el_size, dstbuf_len * q->el_size);
     } else {
         int left = q->len - loc_read_i;
         memcpy(dstbuf, q->buf + loc_read_i * q->el_size, left * q->el_size);
