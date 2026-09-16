@@ -260,6 +260,7 @@ int lfqueue_wait_dequeue(
     int loc_read_i;
     int loc_write_i;
     int avail_to_read;
+    useconds_t accum_sleep = 0;
     while (1) {
         if (timeout_after > 0 && accum_sleep >= timeout_after) {
             goto canceled;
