@@ -52,6 +52,7 @@ int lfqueue_wait_enqueue(
     void *restrict inbuf,
     int inbuf_len,
     useconds_t loop_sleep,
+    useconds_t timeout_after,
     _Atomic bool *cancel_opt);
 
 /*
@@ -67,6 +68,7 @@ int lfqueue_wait_dequeue(
     void *restrict dstbuf,
     int dstbuf_len,
     useconds_t loop_sleep,
+    useconds_t timeout_after,
     _Atomic bool *cancel_opt);
 
 #ifdef SPSC_LFQUEUE_IMPL
@@ -182,7 +184,13 @@ int lfqueue_try_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len)
     return LFQUEUE_SUCCESS;
 }
 
-int lfqueue_wait_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len, useconds_t loop_sleep, _Atomic bool *cancel_opt)
+int lfqueue_wait_enqueue(
+    LFQueue *q,
+    void *restrict inbuf_v,
+    int inbuf_len,
+    useconds_t loop_sleep,
+    useconds_t timeout_after;
+    _Atomic bool *cancel_opt)
 {
     uint8_t *inbuf = inbuf_v;
     if (inbuf_len > q->len / 2) {
@@ -193,7 +201,11 @@ int lfqueue_wait_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len, usec
     int loc_write_i;
     int loc_read_i;
     int avail_to_write;
+    useconds_t accum_sleep = 0;
     while (1) {
+        if (timeout_after > 0 && accum_sleep >= timeout_after) {
+            goto canceled;
+        }
         if (cancel_opt && atomic_load_explicit(cancel_opt, memory_order_relaxed)) {
             goto canceled;
         }
@@ -212,6 +224,7 @@ int lfqueue_wait_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len, usec
             (q->len - loc_write_i) + loc_read_i - 1;
     
         if (avail_to_write < inbuf_len) {
+            accum_sleep += loop_sleep;            
             usleep(loop_sleep);
             continue;
         } else {
@@ -234,7 +247,13 @@ canceled:
     return LFQUEUE_OP_CANCELED;
 }
 
-int lfqueue_wait_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len, useconds_t loop_sleep, _Atomic bool *cancel_opt)
+int lfqueue_wait_dequeue(
+    LFQueue *q,
+    void *restrict dstbuf_v,
+    int dstbuf_len,
+    useconds_t loop_sleep,
+    useconds_t timeout_after;
+    _Atomic bool *cancel_opt)
 {
     uint8_t *dstbuf = dstbuf_v;
     if (dstbuf_len == 0) return LFQUEUE_SUCCESS;
@@ -242,6 +261,9 @@ int lfqueue_wait_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len, us
     int loc_write_i;
     int avail_to_read;
     while (1) {
+        if (timeout_after > 0 && accum_sleep >= timeout_after) {
+            goto canceled;
+        }
         if (cancel_opt && atomic_load_explicit(cancel_opt, memory_order_relaxed)) {
             goto canceled;
         }
@@ -253,6 +275,7 @@ int lfqueue_wait_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len, us
             loc_write_i - loc_read_i :
             (q->len - loc_read_i) + loc_write_i;
         if (avail_to_read < dstbuf_len) {
+            accum_sleep += loop_sleep;
             usleep(loop_sleep);
             continue;
         } else {
