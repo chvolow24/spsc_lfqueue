@@ -252,7 +252,7 @@ int lfqueue_wait_dequeue(
     void *restrict dstbuf_v,
     int dstbuf_len,
     useconds_t loop_sleep,
-    useconds_t timeout_after;
+    useconds_t timeout_after,
     _Atomic bool *cancel_opt)
 {
     uint8_t *dstbuf = dstbuf_v;
