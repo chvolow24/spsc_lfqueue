@@ -189,7 +189,7 @@ int lfqueue_wait_enqueue(
     void *restrict inbuf_v,
     int inbuf_len,
     useconds_t loop_sleep,
-    useconds_t timeout_after;
+    useconds_t timeout_after,
     _Atomic bool *cancel_opt)
 {
     uint8_t *inbuf = inbuf_v;
