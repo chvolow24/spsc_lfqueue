@@ -19,17 +19,24 @@ enum {
 typedef struct lock_free_queue {
     uint8_t *buf;
     size_t el_size;
+    int max_len;
     int len;
     int wrap_mask;
     _Atomic int write_i;
     _Atomic int read_i;
 } LFQueue;
 
-/* Allocate the ring buffer and initialize values */
+/* Allocate the ring buffer and initialize values. */
 int lfqueue_init(LFQueue *q, size_t el_size, int len);
 
 /* Free the ring buffer */
 void lfqueue_deinit(LFQueue *q);
+
+/* len must be less than or equal to the initialized size.
+   else, deinit and reinit with the new len
+ */
+int lfqueue_set_len(LFQueue *q, int len);
+
 
 /* Return LFQUEUE_SUCCESS or an error code < 0 */
 int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf, int inbuf_len);
@@ -105,6 +112,7 @@ int lfqueue_init(LFQueue *q, size_t el_size, int len)
     atomic_store(&q->write_i, 0);
     q->buf = malloc(el_size * len);
     q->el_size = el_size;
+    q->max_len = len;
     q->len = len;
     q->wrap_mask = len - 1;
     return len;
@@ -114,6 +122,20 @@ void lfqueue_deinit(LFQueue *q)
 {
     if (q->buf) free(q->buf);
     q->buf = NULL;
+}
+
+int lfqueue_set_len(LFQueue *q, int len)
+{
+    if (len > q->max_len) return q->len;
+    if (len < 4) len = 4;
+    double lg = log2(len);
+    double lgfl = floor(lg);
+    if (lg != lgfl) {
+        len = pow(2.0, lgfl + 1.0);
+    }
+    q->len = len;
+    q->wrap_mask = len - 1;
+    return len;
 }
 
 int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len)
