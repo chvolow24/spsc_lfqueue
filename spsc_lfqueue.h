@@ -13,6 +13,7 @@ enum {
     LFQUEUE_EMPTY,
     LFQUEUE_OVERSIZE_INBUF,
     LFQUEUE_OP_CANCELED,
+    LFQUEUE_LEN_LOCKED,
     LFQUEUE_NUM_STATUS_CODES
 };
 
@@ -24,6 +25,7 @@ typedef struct lock_free_queue {
     int wrap_mask;
     _Atomic int write_i;
     _Atomic int read_i;
+    _Atomic int len_lock;
 } LFQueue;
 
 /* Allocate the ring buffer and initialize values. */
@@ -88,8 +90,49 @@ static const char *lfqueue_errstr[] = {
     "Queue full",
     "Queue empty",
     "Cannot enqueue data longer than half ring buf len",
-    "Wait canceled"
+    "Wait canceled",
+    "Queue length being reset"
 };
+
+static int reader_try_acquire_len_lock(LFQueue *q)
+{
+    int len_lock_val;
+    do {
+        len_lock_val = atomic_load_explicit(&q->len_lock, memory_order_relaxed);
+        if (len_lock_val < 0) {
+            return LFQUEUE_LEN_LOCKED;
+        }
+    } while (!atomic_compare_exchange_strong_explicit(
+                 &q->len_lock,
+                 &len_lock_val,
+                 len_lock_val + 1,
+                 memory_order_acquire,
+                 memory_order_relaxed));
+    return LFQUEUE_SUCCESS;
+}
+
+static void reader_release_len_lock(LFQueue *q)
+{
+    atomic_fetch_sub_explicit(&q->len_lock, 1, memory_order_release);
+}
+
+static void writer_wait_acquire_len_lock(LFQueue *q)
+{
+    int expected = 0;
+    while (!atomic_compare_exchange_strong_explicit(
+               &q->len_lock,
+               &expected,
+               -1,
+               memory_order_release,
+               memory_order_relaxed)) {
+        expected = 0;
+    }
+}
+
+static void writer_release_len_lock(LFQueue *q)
+{
+    atomic_store_explicit(&q->len_lock, 0, memory_order_release);
+}
 
 const char *lfqueue_get_errstr(int error_code)
 {
@@ -127,6 +170,9 @@ void lfqueue_deinit(LFQueue *q)
 int lfqueue_set_len(LFQueue *q, int len)
 {
     if (len > q->max_len) return q->len;
+    
+    writer_wait_acquire_len_lock(q);
+    
     if (len < 4) len = 4;
     double lg = log2(len);
     double lgfl = floor(lg);
@@ -135,6 +181,13 @@ int lfqueue_set_len(LFQueue *q, int len)
     }
     q->len = len;
     q->wrap_mask = len - 1;
+    atomic_store_explicit(&q->write_i, 0, memory_order_relaxed);
+    atomic_store_explicit(&q->read_i, 0, memory_order_relaxed);
+    memset(q->buf, 0, len * q->el_size);
+    
+
+    writer_release_len_lock(q);
+    
     return len;
 }
 
@@ -146,6 +199,11 @@ int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len)
     } else if (inbuf_len == 0) {
         return LFQUEUE_SUCCESS;
     }
+    
+    if (reader_try_acquire_len_lock(q) != LFQUEUE_SUCCESS) {
+        return LFQUEUE_LEN_LOCKED;
+    }
+    
     int loc_write_i = atomic_load_explicit(&q->write_i, memory_order_relaxed);
 
     /* Load of read_i must be 'acquire' to prevent writes below from moving
@@ -161,7 +219,10 @@ int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len)
         loc_read_i - loc_write_i - 1 :
         (q->len - loc_write_i) + loc_read_i - 1;
     
-    if (avail_to_write < inbuf_len) return LFQUEUE_FULL;
+    if (avail_to_write < inbuf_len) {
+        reader_release_len_lock(q);
+        return LFQUEUE_FULL;
+    }
      
     int write_dst = (loc_write_i + inbuf_len) & q->wrap_mask;
 
@@ -174,6 +235,8 @@ int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len)
     }
     atomic_store_explicit(&q->write_i, write_dst, memory_order_release);
 
+    reader_release_len_lock(q);
+    
     return LFQUEUE_SUCCESS;
 }
 
@@ -181,6 +244,12 @@ int lfqueue_try_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len)
 {
     uint8_t *dstbuf = dstbuf_v;
     if (dstbuf_len == 0) return LFQUEUE_SUCCESS;
+
+    if (reader_try_acquire_len_lock(q) != LFQUEUE_SUCCESS) {
+        return LFQUEUE_LEN_LOCKED;
+    }
+
+    
     int loc_read_i = atomic_load_explicit(&q->read_i, memory_order_relaxed);
     int loc_write_i = atomic_load_explicit(&q->write_i, memory_order_acquire);
 
@@ -190,6 +259,7 @@ int lfqueue_try_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len)
         (q->len - loc_read_i) + loc_write_i;
 
     if (avail_to_read < dstbuf_len) {
+        reader_release_len_lock(q);
         return LFQUEUE_EMPTY;
     }
 
@@ -202,6 +272,8 @@ int lfqueue_try_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len)
         memcpy(dstbuf + left * q->el_size, q->buf, read_dst * q->el_size);
     }
     atomic_store_explicit(&q->read_i, read_dst, memory_order_release);
+
+    reader_release_len_lock(q);
     
     return LFQUEUE_SUCCESS;
 }
@@ -220,6 +292,12 @@ int lfqueue_wait_enqueue(
     } else if (inbuf_len == 0) {
         return LFQUEUE_SUCCESS;
     }
+
+    if (reader_try_acquire_len_lock(q) != LFQUEUE_SUCCESS) {
+        return LFQUEUE_LEN_LOCKED;
+    }
+
+    
     int loc_write_i;
     int loc_read_i;
     int avail_to_write;
@@ -264,8 +342,10 @@ int lfqueue_wait_enqueue(
         memcpy(q->buf, inbuf + left * q->el_size, write_dst * q->el_size);
     }
     atomic_store_explicit(&q->write_i, write_dst, memory_order_release);
+    reader_release_len_lock(q);
     return LFQUEUE_SUCCESS;
 canceled:
+    reader_release_len_lock(q);
     return LFQUEUE_OP_CANCELED;
 }
 
@@ -279,6 +359,12 @@ int lfqueue_wait_dequeue(
 {
     uint8_t *dstbuf = dstbuf_v;
     if (dstbuf_len == 0) return LFQUEUE_SUCCESS;
+
+    if (reader_try_acquire_len_lock(q) != LFQUEUE_SUCCESS) {
+        return LFQUEUE_LEN_LOCKED;
+    }
+
+        
     int loc_read_i;
     int loc_write_i;
     int avail_to_read;
@@ -315,9 +401,10 @@ int lfqueue_wait_dequeue(
         memcpy(dstbuf + left * q->el_size, q->buf, read_dst * q->el_size);
     }
     atomic_store_explicit(&q->read_i, read_dst, memory_order_release);
-    
+    reader_release_len_lock(q);
     return LFQUEUE_SUCCESS;
 canceled:
+    reader_release_len_lock(q);
     return LFQUEUE_OP_CANCELED;
 }
 
