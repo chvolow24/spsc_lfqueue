@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -111,7 +112,7 @@ int lfqueue_init(LFQueue *q, size_t el_size, int len)
     atomic_store(&q->write_i, 0);
     q->buf = malloc(el_size * len);
     q->el_size = el_size;
-    max_len = len;
+    q->max_len = len;
     atomic_store(&q->len, len);
     return len;
 }
@@ -124,20 +125,21 @@ void lfqueue_deinit(LFQueue *q)
 
 int lfqueue_set_len(LFQueue *q, int len)
 {
-    if (len > q->max_len) return atomic_load_explicit(q->len, memory_order_relaxed);
+    if (len > q->max_len) return atomic_load_explicit(&q->len, memory_order_relaxed);
     if (len < 4) len = 4;
     double lg = log2(len);
     double lgfl = floor(lg);
     if (lg != lgfl) {
         len = pow(2.0, lgfl + 1.0);
     }
-    atomic_store_explicit(&q->len, len);
+    atomic_store(&q->len, len);
+    fprintf(stderr, "Stored %d\n", len);
     return len;
 }
 
 int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len)
 {
-    int len = atomic_load_explicit(&q->len);
+    int len = atomic_load_explicit(&q->len, memory_order_relaxed);
     int wrap_mask = len - 1;
     uint8_t *inbuf = inbuf_v;    
     if (inbuf_len > len / 2) {
@@ -146,6 +148,10 @@ int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len)
         return LFQUEUE_SUCCESS;
     }
     int loc_write_i = atomic_load_explicit(&q->write_i, memory_order_relaxed);
+    if (loc_write_i >= len) {
+        atomic_store(&q->write_i, 0);
+        return LFQUEUE_FULL;
+    }
 
     /* Load of read_i must be 'acquire' to prevent writes below from moving
        before the reader releases its index */
@@ -178,12 +184,17 @@ int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len)
 
 int lfqueue_try_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len)
 {
-    int len = atomic_load_explicit(&q->len);
+    int len = atomic_load_explicit(&q->len, memory_order_relaxed);
     int wrap_mask = len - 1;
 
     uint8_t *dstbuf = dstbuf_v;
     if (dstbuf_len == 0) return LFQUEUE_SUCCESS;
     int loc_read_i = atomic_load_explicit(&q->read_i, memory_order_relaxed);
+    if (loc_read_i >= len) {
+        atomic_store(&q->read_i, 0);
+        return LFQUEUE_EMPTY;
+    }
+
     int loc_write_i = atomic_load_explicit(&q->write_i, memory_order_acquire);
 
     int avail_to_read =
@@ -216,7 +227,7 @@ int lfqueue_wait_enqueue(
     useconds_t timeout_after,
     _Atomic bool *cancel_opt)
 {
-    int len = atomic_load_explicit(&q->len);
+    int len = atomic_load_explicit(&q->len, memory_order_relaxed);
     int wrap_mask = len - 1;
 
     uint8_t *inbuf = inbuf_v;
@@ -237,6 +248,11 @@ int lfqueue_wait_enqueue(
             goto canceled;
         }
         loc_write_i = atomic_load_explicit(&q->write_i, memory_order_relaxed);
+        if (loc_write_i >= len) {
+            atomic_store(&q->write_i, 0);
+            goto canceled;
+        }
+
 
         /* Load of read_i must be 'acquire' to prevent writes below from moving
            before the reader releases its index */
@@ -282,7 +298,7 @@ int lfqueue_wait_dequeue(
     useconds_t timeout_after,
     _Atomic bool *cancel_opt)
 {
-    int len = atomic_load_explicit(&q->len);
+    int len = atomic_load_explicit(&q->len, memory_order_relaxed);
     int wrap_mask = len - 1;
 
     uint8_t *dstbuf = dstbuf_v;
@@ -299,7 +315,13 @@ int lfqueue_wait_dequeue(
             goto canceled;
         }
         loc_read_i = atomic_load_explicit(&q->read_i, memory_order_relaxed);
+        if (loc_read_i >= len) {
+            atomic_store(&q->read_i, 0);
+            goto canceled;
+        }
+
         loc_write_i = atomic_load_explicit(&q->write_i, memory_order_acquire);
+
 
         avail_to_read =
             loc_read_i <= loc_write_i ?
