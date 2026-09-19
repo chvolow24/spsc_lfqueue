@@ -20,8 +20,7 @@ typedef struct lock_free_queue {
     uint8_t *buf;
     size_t el_size;
     int max_len;
-    int len;
-    int wrap_mask;
+    _Atomic int len;
     _Atomic int write_i;
     _Atomic int read_i;
 } LFQueue;
@@ -112,9 +111,8 @@ int lfqueue_init(LFQueue *q, size_t el_size, int len)
     atomic_store(&q->write_i, 0);
     q->buf = malloc(el_size * len);
     q->el_size = el_size;
-    q->max_len = len;
-    q->len = len;
-    q->wrap_mask = len - 1;
+    max_len = len;
+    atomic_store(&q->len, len);
     return len;
 }
 
@@ -126,22 +124,23 @@ void lfqueue_deinit(LFQueue *q)
 
 int lfqueue_set_len(LFQueue *q, int len)
 {
-    if (len > q->max_len) return q->len;
+    if (len > q->max_len) return atomic_load_explicit(q->len, memory_order_relaxed);
     if (len < 4) len = 4;
     double lg = log2(len);
     double lgfl = floor(lg);
     if (lg != lgfl) {
         len = pow(2.0, lgfl + 1.0);
     }
-    q->len = len;
-    q->wrap_mask = len - 1;
+    atomic_store_explicit(&q->len, len);
     return len;
 }
 
 int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len)
 {
+    int len = atomic_load_explicit(&q->len);
+    int wrap_mask = len - 1;
     uint8_t *inbuf = inbuf_v;    
-    if (inbuf_len > q->len / 2) {
+    if (inbuf_len > len / 2) {
         return LFQUEUE_OVERSIZE_INBUF;
     } else if (inbuf_len == 0) {
         return LFQUEUE_SUCCESS;
@@ -159,16 +158,16 @@ int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len)
     int avail_to_write =
         loc_write_i < loc_read_i ?
         loc_read_i - loc_write_i - 1 :
-        (q->len - loc_write_i) + loc_read_i - 1;
+        (len - loc_write_i) + loc_read_i - 1;
     
     if (avail_to_write < inbuf_len) return LFQUEUE_FULL;
      
-    int write_dst = (loc_write_i + inbuf_len) & q->wrap_mask;
+    int write_dst = (loc_write_i + inbuf_len) & wrap_mask;
 
     if (loc_write_i < write_dst) {
         memcpy(q->buf + loc_write_i * q->el_size, inbuf, inbuf_len * q->el_size);
     } else {
-        int left = q->len - loc_write_i;
+        int left = len - loc_write_i;
         memcpy(q->buf + loc_write_i * q->el_size, inbuf, left * q->el_size);
         memcpy(q->buf, inbuf + left * q->el_size, write_dst * q->el_size);
     }
@@ -179,6 +178,9 @@ int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len)
 
 int lfqueue_try_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len)
 {
+    int len = atomic_load_explicit(&q->len);
+    int wrap_mask = len - 1;
+
     uint8_t *dstbuf = dstbuf_v;
     if (dstbuf_len == 0) return LFQUEUE_SUCCESS;
     int loc_read_i = atomic_load_explicit(&q->read_i, memory_order_relaxed);
@@ -187,17 +189,17 @@ int lfqueue_try_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len)
     int avail_to_read =
         loc_read_i <= loc_write_i ?
         loc_write_i - loc_read_i :
-        (q->len - loc_read_i) + loc_write_i;
+        (len - loc_read_i) + loc_write_i;
 
     if (avail_to_read < dstbuf_len) {
         return LFQUEUE_EMPTY;
     }
 
-    int read_dst = (loc_read_i + dstbuf_len) & q->wrap_mask;
+    int read_dst = (loc_read_i + dstbuf_len) & wrap_mask;
     if (loc_read_i < read_dst) {
         memcpy(dstbuf, q->buf + loc_read_i * q->el_size, dstbuf_len * q->el_size);
     } else {
-        int left = q->len - loc_read_i;
+        int left = len - loc_read_i;
         memcpy(dstbuf, q->buf + loc_read_i * q->el_size, left * q->el_size);
         memcpy(dstbuf + left * q->el_size, q->buf, read_dst * q->el_size);
     }
@@ -214,8 +216,11 @@ int lfqueue_wait_enqueue(
     useconds_t timeout_after,
     _Atomic bool *cancel_opt)
 {
+    int len = atomic_load_explicit(&q->len);
+    int wrap_mask = len - 1;
+
     uint8_t *inbuf = inbuf_v;
-    if (inbuf_len > q->len / 2) {
+    if (inbuf_len > len / 2) {
         return LFQUEUE_OVERSIZE_INBUF;
     } else if (inbuf_len == 0) {
         return LFQUEUE_SUCCESS;
@@ -243,7 +248,7 @@ int lfqueue_wait_enqueue(
         avail_to_write =
             loc_write_i < loc_read_i ?
             loc_read_i - loc_write_i - 1 :
-            (q->len - loc_write_i) + loc_read_i - 1;
+            (len - loc_write_i) + loc_read_i - 1;
     
         if (avail_to_write < inbuf_len) {
             accum_sleep += loop_sleep;            
@@ -254,12 +259,12 @@ int lfqueue_wait_enqueue(
         }
     }
      
-    int write_dst = (loc_write_i + inbuf_len) & q->wrap_mask;
+    int write_dst = (loc_write_i + inbuf_len) & wrap_mask;
 
     if (loc_write_i < write_dst) {
         memcpy(q->buf + loc_write_i * q->el_size, inbuf, inbuf_len * q->el_size);
     } else {
-        int left = q->len - loc_write_i;
+        int left = len - loc_write_i;
         memcpy(q->buf + loc_write_i * q->el_size, inbuf, left * q->el_size);
         memcpy(q->buf, inbuf + left * q->el_size, write_dst * q->el_size);
     }
@@ -277,6 +282,9 @@ int lfqueue_wait_dequeue(
     useconds_t timeout_after,
     _Atomic bool *cancel_opt)
 {
+    int len = atomic_load_explicit(&q->len);
+    int wrap_mask = len - 1;
+
     uint8_t *dstbuf = dstbuf_v;
     if (dstbuf_len == 0) return LFQUEUE_SUCCESS;
     int loc_read_i;
@@ -296,7 +304,7 @@ int lfqueue_wait_dequeue(
         avail_to_read =
             loc_read_i <= loc_write_i ?
             loc_write_i - loc_read_i :
-            (q->len - loc_read_i) + loc_write_i;
+            (len - loc_read_i) + loc_write_i;
         if (avail_to_read < dstbuf_len) {
             accum_sleep += loop_sleep;
             usleep(loop_sleep);
@@ -306,11 +314,11 @@ int lfqueue_wait_dequeue(
         }
     }
 
-    int read_dst = (loc_read_i + dstbuf_len) & q->wrap_mask;
+    int read_dst = (loc_read_i + dstbuf_len) & wrap_mask;
     if (loc_read_i < read_dst) {
         memcpy(dstbuf, q->buf + loc_read_i * q->el_size, dstbuf_len * q->el_size);
     } else {
-        int left = q->len - loc_read_i;
+        int left = len - loc_read_i;
         memcpy(dstbuf, q->buf + loc_read_i * q->el_size, left * q->el_size);
         memcpy(dstbuf + left * q->el_size, q->buf, read_dst * q->el_size);
     }
