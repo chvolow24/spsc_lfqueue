@@ -60,8 +60,8 @@ int lfqueue_wait_enqueue(
     LFQueue *q,
     void *restrict inbuf,
     int inbuf_len,
-    useconds_t loop_sleep,
-    useconds_t timeout_after,
+    uint64_t loop_sleep,
+    uint64_t timeout_after,
     _Atomic bool *cancel_opt);
 
 /*
@@ -76,14 +76,24 @@ int lfqueue_wait_dequeue(
     LFQueue *q,
     void *restrict dstbuf,
     int dstbuf_len,
-    useconds_t loop_sleep,
-    useconds_t timeout_after,
+    uint64_t loop_sleep,
+    uint64_t timeout_after,
     _Atomic bool *cancel_opt);
 
 #ifdef SPSC_LFQUEUE_IMPL
 
 #include <math.h>
 #include <stdlib.h>
+#include <time.h>
+
+static inline int sleep_us(uint64_t us)
+{
+    struct timespec ts = {
+        .tv_sec = us / 1000000,
+        .tv_nsec = (us % 1000000) * 1000
+    };
+    return nanosleep(&ts, NULL);
+}
 
 static const char *lfqueue_errstr[] = {
     "Success",
@@ -282,8 +292,8 @@ int lfqueue_wait_enqueue(
     LFQueue *q,
     void *restrict inbuf_v,
     int inbuf_len,
-    useconds_t loop_sleep,
-    useconds_t timeout_after,
+    uint64_t loop_sleep,
+    uint64_t timeout_after,
     _Atomic bool *cancel_opt)
 {
     uint8_t *inbuf = inbuf_v;
@@ -301,7 +311,7 @@ int lfqueue_wait_enqueue(
     int loc_write_i;
     int loc_read_i;
     int avail_to_write;
-    useconds_t accum_sleep = 0;
+    uint64_t accum_sleep = 0;
     while (1) {
         if (timeout_after > 0 && accum_sleep >= timeout_after) {
             goto canceled;
@@ -325,7 +335,7 @@ int lfqueue_wait_enqueue(
     
         if (avail_to_write < inbuf_len) {
             accum_sleep += loop_sleep;            
-            usleep(loop_sleep);
+            sleep_us(loop_sleep);
             continue;
         } else {
             break;
@@ -353,8 +363,8 @@ int lfqueue_wait_dequeue(
     LFQueue *q,
     void *restrict dstbuf_v,
     int dstbuf_len,
-    useconds_t loop_sleep,
-    useconds_t timeout_after,
+    uint64_t loop_sleep,
+    uint64_t timeout_after,
     _Atomic bool *cancel_opt)
 {
     uint8_t *dstbuf = dstbuf_v;
@@ -368,7 +378,7 @@ int lfqueue_wait_dequeue(
     int loc_read_i;
     int loc_write_i;
     int avail_to_read;
-    useconds_t accum_sleep = 0;
+    uint64_t accum_sleep = 0;
     while (1) {
         if (timeout_after > 0 && accum_sleep >= timeout_after) {
             goto canceled;
@@ -385,7 +395,7 @@ int lfqueue_wait_dequeue(
             (q->len - loc_read_i) + loc_write_i;
         if (avail_to_read < dstbuf_len) {
             accum_sleep += loop_sleep;
-            usleep(loop_sleep);
+            sleep_us(loop_sleep);
             continue;
         } else {
             break;
