@@ -133,7 +133,7 @@ static void writer_wait_acquire_len_lock(LFQueue *q)
                &q->len_lock,
                &expected,
                -1,
-               memory_order_release,
+               memory_order_acquire,
                memory_order_relaxed)) {
         expected = 0;
     }
@@ -203,15 +203,18 @@ int lfqueue_set_len(LFQueue *q, int len)
 
 int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len)
 {
-    uint8_t *inbuf = inbuf_v;    
-    if (inbuf_len > q->len / 2) {
-        return LFQUEUE_OVERSIZE_INBUF;
-    } else if (inbuf_len == 0) {
-        return LFQUEUE_SUCCESS;
-    }
+    uint8_t *inbuf = inbuf_v;
     
     if (reader_try_acquire_len_lock(q) != LFQUEUE_SUCCESS) {
         return LFQUEUE_LEN_LOCKED;
+    }
+
+    if (inbuf_len > q->len / 2) {
+        reader_release_len_lock(q);
+        return LFQUEUE_OVERSIZE_INBUF;
+    } else if (inbuf_len == 0) {
+        reader_release_len_lock(q);
+        return LFQUEUE_SUCCESS;
     }
     
     int loc_write_i = atomic_load_explicit(&q->write_i, memory_order_relaxed);
@@ -258,7 +261,6 @@ int lfqueue_try_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len)
     if (reader_try_acquire_len_lock(q) != LFQUEUE_SUCCESS) {
         return LFQUEUE_LEN_LOCKED;
     }
-
     
     int loc_read_i = atomic_load_explicit(&q->read_i, memory_order_relaxed);
     int loc_write_i = atomic_load_explicit(&q->write_i, memory_order_acquire);
@@ -296,66 +298,31 @@ int lfqueue_wait_enqueue(
     uint64_t timeout_after,
     _Atomic bool *cancel_opt)
 {
-    uint8_t *inbuf = inbuf_v;
-    if (inbuf_len > q->len / 2) {
-        return LFQUEUE_OVERSIZE_INBUF;
-    } else if (inbuf_len == 0) {
-        return LFQUEUE_SUCCESS;
-    }
-
-    if (reader_try_acquire_len_lock(q) != LFQUEUE_SUCCESS) {
-        return LFQUEUE_LEN_LOCKED;
-    }
-
-    
-    int loc_write_i;
-    int loc_read_i;
-    int avail_to_write;
     uint64_t accum_sleep = 0;
-    while (1) {
+    int ret = LFQUEUE_SUCCESS;
+    bool exit = false;
+    while (!exit) {
         if (timeout_after > 0 && accum_sleep >= timeout_after) {
             goto canceled;
         }
         if (cancel_opt && atomic_load_explicit(cancel_opt, memory_order_relaxed)) {
             goto canceled;
         }
-        loc_write_i = atomic_load_explicit(&q->write_i, memory_order_relaxed);
-
-        /* Load of read_i must be 'acquire' to prevent writes below from moving
-           before the reader releases its index */
-        loc_read_i = atomic_load_explicit(&q->read_i, memory_order_acquire);
-
-        /* Although the reader may read during this operation, we can guarantee
-           that the index values here represent the minimum amount of writable
-           space in the buffer */
-        avail_to_write =
-            loc_write_i < loc_read_i ?
-            loc_read_i - loc_write_i - 1 :
-            (q->len - loc_write_i) + loc_read_i - 1;
-    
-        if (avail_to_write < inbuf_len) {
+        ret = lfqueue_try_enqueue(q, inbuf_v, inbuf_len);
+        switch (ret) {
+        case LFQUEUE_SUCCESS:
+        case LFQUEUE_OVERSIZE_INBUF:
+        case LFQUEUE_OP_CANCELED:
+            exit = true;
+            break;
+        default:
             accum_sleep += loop_sleep;            
             sleep_us(loop_sleep);
-            continue;
-        } else {
-            break;
+            continue;            
         }
     }
-     
-    int write_dst = (loc_write_i + inbuf_len) & q->wrap_mask;
-
-    if (loc_write_i < write_dst) {
-        memcpy(q->buf + loc_write_i * q->el_size, inbuf, inbuf_len * q->el_size);
-    } else {
-        int left = q->len - loc_write_i;
-        memcpy(q->buf + loc_write_i * q->el_size, inbuf, left * q->el_size);
-        memcpy(q->buf, inbuf + left * q->el_size, write_dst * q->el_size);
-    }
-    atomic_store_explicit(&q->write_i, write_dst, memory_order_release);
-    reader_release_len_lock(q);
-    return LFQUEUE_SUCCESS;
+    return ret;
 canceled:
-    reader_release_len_lock(q);
     return LFQUEUE_OP_CANCELED;
 }
 
@@ -367,54 +334,31 @@ int lfqueue_wait_dequeue(
     uint64_t timeout_after,
     _Atomic bool *cancel_opt)
 {
-    uint8_t *dstbuf = dstbuf_v;
-    if (dstbuf_len == 0) return LFQUEUE_SUCCESS;
-
-    if (reader_try_acquire_len_lock(q) != LFQUEUE_SUCCESS) {
-        return LFQUEUE_LEN_LOCKED;
-    }
-
-        
-    int loc_read_i;
-    int loc_write_i;
-    int avail_to_read;
     uint64_t accum_sleep = 0;
-    while (1) {
+    int ret = LFQUEUE_SUCCESS;
+    bool exit = false;
+    while (!exit) {
         if (timeout_after > 0 && accum_sleep >= timeout_after) {
             goto canceled;
         }
         if (cancel_opt && atomic_load_explicit(cancel_opt, memory_order_relaxed)) {
             goto canceled;
         }
-        loc_read_i = atomic_load_explicit(&q->read_i, memory_order_relaxed);
-        loc_write_i = atomic_load_explicit(&q->write_i, memory_order_acquire);
-
-        avail_to_read =
-            loc_read_i <= loc_write_i ?
-            loc_write_i - loc_read_i :
-            (q->len - loc_read_i) + loc_write_i;
-        if (avail_to_read < dstbuf_len) {
-            accum_sleep += loop_sleep;
-            sleep_us(loop_sleep);
-            continue;
-        } else {
+        ret = lfqueue_try_dequeue(q, dstbuf_v, dstbuf_len);
+        switch (ret) {
+        case LFQUEUE_SUCCESS:
+        case LFQUEUE_OVERSIZE_INBUF:
+        case LFQUEUE_OP_CANCELED:
+            exit = true;
             break;
+        default:
+            accum_sleep += loop_sleep;            
+            sleep_us(loop_sleep);
+            continue;            
         }
     }
-
-    int read_dst = (loc_read_i + dstbuf_len) & q->wrap_mask;
-    if (loc_read_i < read_dst) {
-        memcpy(dstbuf, q->buf + loc_read_i * q->el_size, dstbuf_len * q->el_size);
-    } else {
-        int left = q->len - loc_read_i;
-        memcpy(dstbuf, q->buf + loc_read_i * q->el_size, left * q->el_size);
-        memcpy(dstbuf + left * q->el_size, q->buf, read_dst * q->el_size);
-    }
-    atomic_store_explicit(&q->read_i, read_dst, memory_order_release);
-    reader_release_len_lock(q);
-    return LFQUEUE_SUCCESS;
+    return ret;
 canceled:
-    reader_release_len_lock(q);
     return LFQUEUE_OP_CANCELED;
 }
 
