@@ -26,6 +26,7 @@ typedef struct lock_free_queue {
     _Atomic int write_i;
     _Atomic int read_i;
     _Atomic int len_lock;
+    _Atomic int enqueued;
 } LFQueue;
 
 /* Allocate the ring buffer and initialize values. */
@@ -39,6 +40,12 @@ void lfqueue_deinit(LFQueue *q);
  */
 int lfqueue_set_len(LFQueue *q, int len);
 
+/* Check the number of items enqueued (informal) */
+int lfqueue_peep_enqueued(LFQueue *q);
+
+/* USE FOR DEBUGGING ONLY.
+   0.0 = queue empty; 1.0 = queue full */
+float lfqueue_peep_used(LFQueue *q);
 
 /* Return LFQUEUE_SUCCESS or an error code < 0 */
 int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf, int inbuf_len);
@@ -246,8 +253,8 @@ int lfqueue_try_enqueue(LFQueue *q, void *restrict inbuf_v, int inbuf_len)
         memcpy(q->buf + loc_write_i * q->el_size, inbuf, left * q->el_size);
         memcpy(q->buf, inbuf + left * q->el_size, write_dst * q->el_size);
     }
+    atomic_fetch_add_explicit(&q->enqueued, inbuf_len, memory_order_relaxed);
     atomic_store_explicit(&q->write_i, write_dst, memory_order_release);
-
     reader_release_len_lock(q);
     
     return LFQUEUE_SUCCESS;
@@ -283,6 +290,7 @@ int lfqueue_try_dequeue(LFQueue *q, void *restrict dstbuf_v, int dstbuf_len)
         memcpy(dstbuf, q->buf + loc_read_i * q->el_size, left * q->el_size);
         memcpy(dstbuf + left * q->el_size, q->buf, read_dst * q->el_size);
     }
+    atomic_fetch_sub_explicit(&q->enqueued, dstbuf_len, memory_order_relaxed);
     atomic_store_explicit(&q->read_i, read_dst, memory_order_release);
 
     reader_release_len_lock(q);
@@ -360,6 +368,23 @@ int lfqueue_wait_dequeue(
     return ret;
 canceled:
     return LFQUEUE_OP_CANCELED;
+}
+
+int lfqueue_peep_enqueued(LFQueue *q)
+{
+    return atomic_load_explicit(&q->enqueued, memory_order_relaxed);
+}
+
+float lfqueue_peep_used(LFQueue *q)
+{
+    if (reader_try_acquire_len_lock(q) == LFQUEUE_SUCCESS) {
+        float ret = (float)atomic_load_explicit(&q->enqueued, memory_order_relaxed)
+            / q->len;
+        reader_release_len_lock(q);
+        return ret;
+    } else {
+        return -1.0f;
+    }
 }
 
 #endif
